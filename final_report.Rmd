@@ -1,0 +1,619 @@
+---
+title: "Predicting NRFIs in the MLB"
+subtitle: "Will a Run Be Scored in the First Inning of an MLB Game?"
+author: "By: Govind Pillai"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+
+---
+![](images/shohei.png){width="100%"}
+\
+\
+```{r, echo=FALSE, message= FALSE}
+library(ISLR)
+
+library(ISLR2)
+library(tidyverse)
+library(tidymodels)
+library(readr)
+library(corrr)
+library(corrplot)
+library(themis)
+library(discrim)
+library(klaR)
+library(tune)
+library(glmnet)
+library(dplyr)
+library(ranger)
+library(ggthemes)
+library(ggplot2)
+library(kknn)
+library(pROC)
+```
+
+# Introduction
+
+The aim of this project is to predict whether a NRFI will occur in any given MLB game. We will be using data that spans three MLB datasets all found on data.world. Let's get into it!
+
+## What is a NRFI?
+
+NRFI, short for "No Run First Inning," has quickly gained popularity as a thrilling betting option among baseball enthusiasts. The concept behind this bet is pretty straightforward. With a baseball game divided into nine innings, each team gets a chance to score runs while batting. An inning concludes once both teams have made three outs. Now, the NRFI bet centers solely on the first inning, challenging bettors to predict whether either team will score a run during that initial frame.
+
+While the NRFI may not be an officially recognized statistic by the MLB, we're interesting in seeing if certain pitching and batting statistics can serve as good predictors for if a NRFI will occur or not. Let's dive deeper into the NRFI, which is widely considered the greatest bet on the diamond.
+
+## Project Outline
+
+Great, now that we know what a NRFI is, how do we predict one? We will be using data that spans three MLB datasets to create a final dataset for our models. This process will involve data cleaning and manipulation to ensure our final dataset includes only relevant observations and predictors useful in predicting NRFIs. Next, we will perform an Exploratory Data Analysis to gain insights into which predictors could be valuable. Following that, we will split the data into training and testing sets, build a recipe, and establish folds for the 5-fold cross-validation implementation. In this project, we will develop four different models on the training data: Logistic Regression, Linear Discriminant Analysis, Quadratic Discriminant Analysis, and Random Forest. Finally, we will assess the performance of each model and determine which one works best for predicting NRFIs. Let's play ball!
+
+# Exploratory Data Analysis
+
+In order to create the best model, we need to clean up the original raw data. Because the final dataset will be a combination of 3 raw datasets, there will also be a lot of tidying to make the data usable.
+
+## Creating the Dataset
+
+The first dataset we will be looking at will be MLB game logs from 1871 - 2016. Lets take a look.
+
+```{r}
+game_logs <- read.csv("data/game_logs.csv")
+colnames(game_logs)
+```
+```{r}
+dim(game_logs)
+```
+
+This dataset provides game logs from 171,907 different games along with 161 possible predictors. Wow! Obviously we won't need all of this data so let's try to trim this set down. The two most important predictors in this dataset are the **v_line_score**  and **h_line_score** (visiting and home line scores). Here are the v line scores from the first 6 games in the dataset.
+
+```{r}
+head(game_logs$v_line_score)
+```
+What do these numbers mean? This value is the amount of runs the visiting team scored each inning. For example, "107000435" means the visiting team scored 1 in the first inning, 0 in the second inning, 7 in the third inning, etc. If we take the first digit of the line score for the visiting and home team, we can create a predictor called "RFI" which is a factor variable that states whether or not a run was scored in the first inning of that game.
+
+```{r, warning = FALSE}
+vline <- game_logs$v_line_score
+
+v_first <- ifelse(substr(vline, 1, 1) != "(",as.numeric(substr(vline, 1, 1)), as.numeric(substr(vline,2,3)))
+hline <- game_logs$h_line_score
+h_first <- ifelse(substr(hline, 1, 1) != "(",as.numeric(substr(hline, 1, 1)), as.numeric(substr(hline,2,3)))
+first <- v_first+h_first
+rfi <- ifelse(first > 0, "yes", "no")
+```
+
+Here, we create a variable called first, which is the sum of the first inning score of both teams. The RFI variable simply states whether that value is greater than 0 (yes) or not (no).
+
+```{r}
+head(data.frame(vline,hline,rfi),10)
+```
+In terms of useful numerical data, that is about as good as it gets for the game logs. This dataset does not provide any batting or pitching statistics. Luckily, we have two other datasets that will provide that for us. For now, lets add some useful categorical predictors that the game_logs provide. These include: pitcher, team, and season IDs.
+
+```{r}
+vpitch <- game_logs$v_starting_pitcher_id
+vpitcher <- substr(vpitch,1,5)
+hpitch <- game_logs$h_starting_pitcher_id
+hpitcher <- substr(hpitch,1,5)
+vteam <- game_logs$v_name
+hteam <- game_logs$h_name
+date <- substr(game_logs$date,1,4)
+test_logs <- data.frame(date,rfi,vpitcher,hpitcher,vteam,hteam)
+```
+
+ With a dataset of 171,907 rows, there is a lot of missing data. If an observation is missing a home or visiting line score, we can't determine the RFI and the data point is useless. Because our dataset is so big, we can afford to simply remove any observations that have missing line scores.
+```{r}
+final_logs <- test_logs[!is.na(test_logs$rfi),]
+```
+
+And with that, lets take a look at a random data point in our game logs set!
+
+```{r}
+final_logs[5739,]
+```
+```{r}
+dim(final_logs)
+```
+We now have access to the pitchers, teams, and RFI of 147,271 baseball games. Now what? We need actual numerical predictors that can help predict a NRFI.
+This seems like a good time to load in our 2nd dataset, the pitching dataset.
+
+```{r}
+pitching_data <- read.csv("data/pitching.csv")
+colnames(pitching_data)
+```
+This dataset gives the season stats of every pitcher in every season from 1871 to 2016. 
+
+Here is a list of major baseball stats that are used in evaluating how good a pitcher is:\
+\
+**ERA:** Earned Run Average. How many runs a batter scores on this pitcher over 9 innings on average.\
+**WHIP:** Walks/Hits per Innings Pitched. The number of batters the pitcher allowed to get on base per inning.\
+**SOP**: Strikeout percentage. The percentage of batters a pitcher has struck out.\
+**HRP**: Home run percentage. The percentage of batters a pitcher has given up a home run. \
+\
+
+Let's calculate these stats from the data and create a final pitching dataset.
+
+```{r, echo=FALSE}
+pitcher <- pitching_data$playerID
+pteam <- pitching_data$teamID
+pitch <- paste(substr(pitcher,1,4),substr(pitcher,6,6),sep="")
+year <- pitching_data$yearID
+era <- pitching_data$ERA
+hits <- pitching_data$H
+walks <- pitching_data$BB
+ipouts <- pitching_data$IPouts
+so <- pitching_data$SO
+bfp <- pitching_data$BFP
+hr <- pitching_data$HR
+whip <- (hits+walks)/ipouts
+sop <- (so/bfp)
+hrp <- (hr/bfp)
+test_pitch <- data.frame(pitch,year,pteam,era,whip,sop,hrp)
+final_pitch <- test_pitch[test_pitch$year < 1970 | test_pitch$year > 1979,]
+```
+
+```{r}
+head(final_pitch)
+```
+```{r}
+dim(final_pitch)
+```
+This data is only 42,007 columns. This makes sense because these are season averages not single game statistics. How are we going to add this to our game logs dataset with nearly 150,000 observations? It is a bit tedious. We need go through every game in the game logs and check for the team, year, and pitching id. Then we can look for a match in the pitching dataset and add the stats for each game. If there are no matches or multiple matches (there are duplicate pitching ids), we can remove that game from our game logs. The game logs will hold two of each pitching stat, one for each team's pitcher. 
+
+Let's first make sure to remove any games with multiple or no matches to the pitching dataset.
+```{r}
+nrow(final_logs)
+```
+
+```{r, eval=FALSE}
+final_data <- final_logs
+valid <- c()
+for(i in 1:nrow(final_data)) {
+  vpi <- final_data[i,3]
+  vteamv <- final_data[i,5]
+  yearv <- final_data[i,1]
+  x <- nrow(filter(final_pitch, pitch == vpi, pteam==vteamv,year==yearv)) == 1
+  valid <- append(valid,x)
+}
+
+validdf <- data.frame(valid)
+final_data["valid"] <- validdf
+final_data_2 <- final_data[final_data$valid,]
+final_data_2
+
+```
+
+The code chunk above is going through every game and only marking the games with exactly one match as valid.Then we remove any invalid observations from the dataset. Our dataset is now ready for the pitching stats. Before we add those, let's look take a look at the batting stats database.
+
+```{r}
+teams_data <- read.csv("data/teams.csv")
+colnames(teams_data)
+```
+We are specifically interested in two batting stats:\
+\
+**BAVG:** Batting average. A batting teams total hits divided by their at-bats.\
+**SLP:** Slugging Percentage. Measures a batting teams efficiency. The formula takes into account exactly how many bases were taken per hit.\
+\
+Notice that these stats are team averages, not single player. While there is only one pitcher for a team in the first inning, there can be any number of batters and in various orders. For batting statistics, it makes sense to use team averages. Let's take a look at our final batting dataset.
+
+```{r}
+tyear <- teams_data$yearID
+team <- teams_data$teamID
+thits <- teams_data$H
+tabs <- teams_data$AB
+twalks <- teams_data$BB
+hbp <- teams_data$HBP
+sf <- teams_data$SF
+sb <- teams_data$X2B
+tb <- teams_data$X3B
+thr <- teams_data$HR
+fb <- thits - (sb+tb+thr)
+bavg <- thits/tabs
+slp <- (fb+(2*sb)+(3*tb)+(4*thr))/(tabs)
+test_teams <- data.frame(tyear,team,bavg,slp)
+final_teams <- test_teams[test_teams$tyear < 1970 | test_teams$tyear > 1979,]
+head(final_teams)
+```
+```{r}
+dim(final_teams)
+```
+Similar to pitching, we will go through every game and look for a matching team and year to find the stats for that game. We do not have to check for valid entries anymore because there is no missing or duplicate data in this set. After adding all the stats, pitching and batting, we have a complete dataset.
+
+```{r, echo=FALSE}
+data1 <- read.csv("data/final_data_hv_predictors.csv")
+data1 <- data1[,-1]
+```
+
+```{r}
+head(data1)
+```
+
+```{r}
+dim(data1)
+```
+This is good so far but we need to wrap up a couple more things. Right now we have two separate predictors for visiting and home teams. While both are necessary because both teams plays in the first inning, we do not need to have them as separate predictors. Instead, we can use the average of the home and visiting team for each stat.
+
+```{r, echo=FALSE}
+data2 <- read.csv("data/final_data_with_missing_data.csv")
+data2 <- data2[,-1]
+```
+```{r}
+head(data2)
+```
+
+```{r}
+dim(data2)
+```
+Ok, we are almost done. While we did account for invalid data within the game logs, we never checked for missing data within the pitching and batting data. Sure enough, we did have missing data within the pitching dataset. Luckily, this only amounted to about 2,000 observations so we were able to remove it from the set. So without further ado, here is the final set.
+
+```{r, echo=FALSE}
+data <- read.csv("data/final_data.csv")
+data <- data[,-1]
+data <- data[,-9]
+```
+```{r}
+head(data)
+```
+
+```{r}
+dim(data)
+```
+We have ourselves a dataset! Let's explore it.
+\
+
+## Exploring the Dataset
+
+We can create some visualizations to better understand our data and get an idea of how well our predictors will perform when it comes time for modeling. Let's get into it.
+
+### Variable Correlation Plot
+
+Let's create a correlation heatmap to spot out relationships between our predictors.
+
+```{r, echo = FALSE}
+data_nums <- data[,-1] %>%  
+  select_if(is.numeric)
+data_cor <- cor(data_nums)
+data_cor_plt <- corrplot(data_cor)
+```
+\
+It seems for the most part, there is little to no relationship between our predictors. A huge exception to that fact is the correlation between ERA and WHIP. This should not be that surprising given the formula of both stats. ERA is calculated by \
+\
+((earned runs given up) * 9 innings)/Innings pitched.
+\
+\
+WHIP is calculated by \
+\
+(Walks + Hits)/Innings Pitched
+\
+\
+If we take out the constant "9" as well as Innings pitched which appears in both equations, we are left comparing the number of runs given up against the amount of times the pitcher allowed someone on base. This makes sense that they are correlated because if a pitcher is allowing a lot of runs, it can be assumed they are allowing a lot of base runners and vice versa.
+
+### RFI
+
+Let's take a look at the distribution of the RFI's in our data.
+
+```{r, echo = FALSE}
+data %>% 
+  ggplot(aes(x = rfi)) +
+  geom_bar() + 
+  labs(x = "RFI", y = "# of Games", title = "Distribution of RFIs over roughly 110,000 games")
+```
+
+We can see that the distribution of RFI is pretty even with the YRFI barely beating out the NRFI. This means our data is not imbalanced and will not be a cause of any inaccuracies we might encounter later on.
+
+### ERA
+
+As discussed before, Earned Run Average (ERA) is a statistic that measures the amount of earned runs a pitcher is giving up on average over the course of 9 innings. While we would hope to only use first inning stats (pitching stats change drastically from the start of a game compared to the end), ERA can still be useful in evaluating how well the pitcher will play in the first inning.
+Let's make a plot to visualize how well ERA could be for our models.
+
+```{r, echo = FALSE}
+data %>%
+  dplyr::select("era", "rfi") %>%
+  dplyr::mutate(era = cut(era, breaks = 
+                             seq(min(era), max(era), by = 1),
+                           include.lowest = TRUE)) %>%
+  group_by(era) %>%
+  na.omit(era) %>%
+  ggplot(aes(era)) +
+  geom_bar(aes(fill = rfi))
+```
+
+This plot is not so encouraging. It is showing that for every era interval which is 1 era unit long, the distribution of the RFI is just about half. This means that whether our ERA is big or small, it is not really affecting RFI. Hopefully we can get better results with our other predictors.
+
+### WHIP
+
+Walks/Hits per Innings Pitched (WHIP) is a way of determining how many base runners a pitcher is allowing. In baseball, the only way to get on base is if you hit the ball or you get a walk (free base due to pitching error). By using these particular stats, we can see how often a batting team is getting on base and having a higher chance of scoring runs. 
+
+```{r, echo = FALSE}
+colnames(data)[4] <- "whips"
+data %>%
+  dplyr::select("whips", "rfi") %>%
+  dplyr::mutate(whips = cut(whips, breaks = 
+                             seq(min(whips), max(whips), by = 0.1),
+                           include.lowest = TRUE)) %>%
+  group_by(whips) %>%
+  na.omit(whips) %>%
+  ggplot(aes(whips)) +
+  geom_bar(aes(fill = rfi))
+```
+\
+Unfortunately, we have a similar predicament where in each interval of whip, we see an even distribution between YRFIs and NRFIs. In this case, it isn't too surprising. We had discovered earlier that the ERA and WHIP predictors  were heavily correlated. It makes sense that both produce similar distributions of the RFI.
+
+### SOP
+
+Strikeout %. The percentage of batters a pitcher faced in which he struck him out. In order for a NRFI to occur, we need 3 outs per pitcher. If we can get a pitcher that is able to get a high percentage of batters out without allowing someone to get on base, it significantly raises the chances of a NRFI. That is the significance of the strikeout percentage.
+
+```{r, echo=FALSE}
+colnames(data)[5] <- "sops"
+data %>%
+  dplyr::select("sops", "rfi") %>%
+  dplyr::mutate(sops = cut(sops, breaks = 
+                             seq(min(sops), max(sops), by = 0.05),
+                           include.lowest = TRUE)) %>%
+  group_by(sops) %>%
+  na.omit(sops) %>%
+  ggplot(aes(sops)) +
+  geom_bar(aes(fill = rfi))
+```
+\
+It seems as though this predictor is more of the same. We can see in the intervals of 0.05 SOP units, we have an even distribution of YRFIs and NRFIs. It's time to move on to our final pitching predictor, the home run percentage.
+
+### HRP
+
+Home Run %. The formula that we used is more simple than the actual HR% equation but should not differ much when it comes time to model. HR% is the percentage of batters a pitcher allows a home run. Home runs are the number 1 cause for a NRFI to fail because all it takes is one hit for the YRFI to cash. Therefore, we would think pitchers with high HRP would have a smaller amount of NRFIs.
+
+```{r, echo=FALSE}
+colnames(data)[6] <- "hrps"
+data %>%
+  dplyr::select("hrps", "rfi") %>%
+  dplyr::mutate(hrps = cut(hrps, breaks = 
+                             seq(min(hrps), max(hrps), by = 0.01),
+                           include.lowest = TRUE)) %>%
+  group_by(hrps) %>%
+  na.omit(hrps) %>%
+  ggplot(aes(hrps)) +
+  geom_bar(aes(fill = rfi))
+```
+
+Our final pitching stat also seems pretty split. So far in our EDA, we found that all our pitching stats may not be very good for predicting NRFIs. Let's take a look a the two batting stats.
+
+### BAVG
+
+BAVG is the batting average of team. The calculation is simple: The team's total hits divided by their at-bats(the amount of times they batted). The logic here is that if the team is getting hits on a high percentage of their opportunities, they are more likely to score runs and in turn, a YRFI.
+
+```{r, echo=FALSE}
+colnames(data)[7] <- "bavgs"
+data %>%
+  dplyr::select("bavgs", "rfi") %>%
+  dplyr::mutate(bavgs = cut(bavgs, breaks = 
+                             seq(min(bavgs), max(bavgs), by = 0.01),
+                           include.lowest = TRUE)) %>%
+  group_by(bavgs) %>%
+  na.omit(bavgs) %>%
+  ggplot(aes(bavgs)) +
+  geom_bar(aes(fill = rfi))
+```
+
+
+No luck with our batting stats. In our intervals with 0.1 BAVG units, we see an even distribution of RFIs. Now it is time for the final stat, slugging percentage.
+
+### SLP
+
+Slugging %. This stat is a tricky formula that calculates how well a team gets on base. It is basically the Total Bases divided by the teams at bats. To calculate the team's total bases, you take all their singles plus their doubles times 2 plus their triples times 3 plus their homers times 4. If a team is slugging at a high percentage, they are getting on base more and raising the chances of a YRFI.
+
+```{r, echo=FALSE}
+colnames(data)[8] <- "slps"
+data %>%
+  dplyr::select("slps", "rfi") %>%
+  dplyr::mutate(slps = cut(slps, breaks = 
+                             seq(min(slps), max(slps), by = 0.01),
+                           include.lowest = TRUE)) %>%
+  group_by(slps) %>%
+  na.omit(slps) %>%
+  ggplot(aes(slps)) +
+  geom_bar(aes(fill = rfi))
+```
+
+
+Another split distribution. Unfortunately, the EDA was not too encouraging. We found that all of our stats are not able to explain when a RFI is N or Y. Still, lets jump into modeling and see how accurate of a model we can create with the stats we have in our dataset.
+
+# Setting Up Models
+
+We have seen how well the predictors match up to our response variable. It's now time to create a model that can actually predict whether a NRFI will occur or not. This process will involve making a train/test split, creating a recipe, and form cross-validation within our models.
+
+## Train/Test Split
+
+In order to avoid over-fitting, it is better to train our model on a big chunk of our data, and then test the accuracy with the rest. This will ensure that our model will actually work for data that is not currently present in our dataset. We will set a random seed so the same split will be replicated every time we run the code. We will also make sure to stratify on the RFI variable.
+
+```{r}
+data <- mutate(data, rfi = factor(rfi)) #make sure that RFI is a factor
+set.seed(3435)
+mlb_split <- initial_split(data, strata = rfi, prop = 0.7)
+mlb_train <- training(mlb_split)
+mlb_test <- testing(mlb_split)
+```
+
+```{r}
+dim(data)
+```
+
+We see based on the dimensions, that the training and testing data is about 70-30 split. These are sufficient values and we can move on to recipe building.
+
+## Recipe Building
+
+Now it is time to create a recipe that brings together our predictor and response variables. The recipe is our chance to specify what predictors from our dataset we want to use. We could also turn any categorical predictors into dummy variables as well as handle any predictors with missing data. With that being said, we have cleaned our dataset to the point where we are using all 8 predictors and have no missing data. In addition, none of the predictors are categorial so we won't have to worry about creating any dummy variables. Below we can see the completed recipe.
+
+```{r, results ='hide'}
+mlb_recipe <- recipe(rfi ~ era + whips + sops + hrps + bavgs + slps, mlb_train) %>% 
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_predictors())
+prep(mlb_recipe) %>% 
+  bake(new_data = mlb_train)
+```
+
+
+## K-Fold Cross Validation
+
+Let's form a stratified cross validation with 5 folds stratifying on our response variable, RFI.
+
+```{r}
+mlb_folds <- vfold_cv(mlb_train, v = 5, 
+                          strata = rfi)
+```
+
+With our setup all done, we can now move on to building the prediction models.
+
+# Model Building
+
+Now it is time to build our models. As stated earlier, we are going to try to fit 4 different models to predict whether or not a NRFI will occur. The 4 models are: Logistic Regression, Linear Discriminant Analysis, Quadratic Discriminant Analysis, and Random Forest. We will use roc_auc as our performance metric for testing the models. For each model we will set up a workflow and add the model and recipe. For our random forest model, we will also need a tuning grid to fine tune the parameters used. We can then fit all the models to our training data and see how well the best model works against our testing data. Let's create our models.
+
+```{r}
+log_reg <- logistic_reg() %>% 
+  set_engine("glm") %>% 
+  set_mode("classification")
+
+log_wkflow <- workflow() %>% 
+  add_model(log_reg) %>% 
+  add_recipe(mlb_recipe)
+
+lda_mod <- discrim_linear() %>% 
+  set_mode("classification") %>% 
+  set_engine("MASS")
+
+lda_wkflow <- workflow() %>% 
+  add_model(lda_mod) %>% 
+  add_recipe(mlb_recipe)
+
+qda_mod <- discrim_quad() %>% 
+  set_mode("classification") %>% 
+  set_engine("MASS")
+
+qda_wkflow <- workflow() %>% 
+  add_model(qda_mod) %>% 
+  add_recipe(mlb_recipe)
+
+rf_class_spec <- rand_forest(mtry = tune(), 
+                           trees = tune(), 
+                           min_n = tune()) %>%
+  set_engine("ranger") %>% 
+  set_mode("classification")
+
+rf_class_wf <- workflow() %>% 
+  add_recipe(mlb_recipe) %>% 
+  add_model(rf_class_spec)
+```
+
+```{r, eval=FALSE}
+rf_grid <- grid_regular(mtry(range = c(1, 6)), 
+                        trees(range = c(200, 600)),
+                        min_n(range = c(10, 20)),
+                        levels = 5)
+```
+
+```{r, echo=FALSE}
+load("tune_class.rda")
+```
+
+# Model Results
+
+We now have all our models created and stored. It is time to finally see how well our models performed. We will start off by looking at the autoplot of our Random Forest model and then jump into the actual performance metrics of each model.
+
+## Model Autoplot 
+
+The first step in analyzing our results is using the autoplot function in R on our Random Forest model. This function provides visualizations on how our model performs as the parameters change. Let's create a Random Forest autoplot.
+
+```{r}
+autoplot(tune_class) + theme_minimal()
+```
+\
+Our random forest plot needed to tune 3 parameters: mtry, trees, and min_n. **Mtry** is the number of variables to randomly sample as candidates at each split. **Trees** is the number of trees in our forest. **Min_n** is the number of data points required for the nodes to be split further down the tree. Let's take a look at the best values for the parameters we tuned.
+ 
+```{r}
+show_best(tune_class, n = 1)
+```
+ Now that we have tuned our parameters, we can create the best version of our Random Forest model.
+
+```{r}
+rf_class_spec_b <- rand_forest(mtry = 1, 
+                           trees = 200, 
+                           min_n = 20) %>%
+  set_engine("ranger") %>% 
+  set_mode("classification")
+
+rf_class_wf_b <- workflow() %>% 
+  add_recipe(mlb_recipe) %>% 
+  add_model(rf_class_spec_b)
+```
+
+We have our models. Let's see how accurate they are.
+
+## Model Accuracy
+
+The metric we will be looking at is **roc_auc**. We will see how this metric compares across all four models we created.
+
+
+
+```{r, echo = FALSE}
+roc_finals <- read.csv("data/rocvals.csv")
+roc_finals <- roc_finals[,-1]
+roc_finals
+```
+
+In machine learning, **ROC AUC** (Receiver Operating Characteristic Area Under the Curve) is a performance metric used to evaluate the performance of binary classification models. It measures the ability of a model to distinguish between two classes by plotting the True Positive Rate (TPR) against the False Positive Rate (FPR) at various classification thresholds. An ROC AUC of 1 means the model can perfectly distinguish between positive and negative instances while a value of 0.5 means the model is randomly guessing. Given the values in the table above, our models did not perform too well in predicting NRFIs. With that being said, the best model we got was Logistic Regression and we will move forward testing how well that model does on the testing dataset.
+
+Here are some more graphics to visualize our ROC_AUC values.
+
+```{r, echo = FALSE}
+mlb_bar_plot <- ggplot(roc_finals, 
+       aes(x = Model, y = ROC_AUC)) + 
+  geom_bar(stat = "identity", width=0.2) + 
+  labs(title = "Performance of Our Models") + 
+  theme_minimal()
+
+mlb_lollipop_plot <- ggplot(roc_finals, aes(x = Model, y = ROC_AUC)) + 
+    geom_segment( aes(x = Model, xend = 0, y = ROC_AUC, yend = 0)) +
+  labs(title = "Performance of Our Models") + 
+  theme_minimal()
+
+mlb_dot_plot <- ggplot(roc_finals, aes(x = Model, y = ROC_AUC)) +
+  geom_point(size=10) + 
+  geom_segment(aes(x = Model, 
+                   xend = Model, 
+                   y=min(ROC_AUC), 
+                   yend = max(ROC_AUC)), 
+               linetype = "dashed", 
+               linewidth=0.5) + 
+  labs(title = "Performance of Our Models") + 
+  theme_minimal() +
+  coord_flip()
+```
+
+```{r}
+mlb_bar_plot
+```
+```{r}
+mlb_lollipop_plot
+```
+```{r}
+mlb_dot_plot
+```
+
+# Final Model Accuracy
+
+Now the final test, seeing how accurate our best model is against the mlb_test data we created before. We will do this by creating a confusion matrix and seeing what percentage of the logistical regression model's predictions are correct. 
+
+```{r}
+log_fit <- fit(log_wkflow, mlb_train)
+augment(log_fit, new_data = mlb_test) %>%
+  conf_mat(truth = rfi, estimate = .pred_class)
+```
+Officially, our best model can predict RFIs with **0.542** accuracy! That is pretty bad. Unfortunately, I will probably not be able to use this model for sports betting over the summer. 
+
+# Conclusion
+
+Although we had a detailed dataset that was put through many different tests and analyses, we were not able to find a great model to predict NRFIs in the MLB. \
+\
+While the results we produced were disappointing, they were not very surprising. Baseball is a sport that is notoriously difficult to model, and whether a run will be scored in the first inning can seem just plain random at times. With that being said, I believe some changes could be made to this model that would greatly improve its roc auc and accuracy. All of our statistical predictors were player statistics that spanned the whole 9 innings. As stated earlier, a baseball player’s performance in the first inning differs considerably from their performance later in the game. This is most likely caused by players initially settling into the game as well as their bodies wearing out as the game goes on. As a result of this fact, our model could also differ greatly if we were to use only first-inning stats rather than full-game stats. If I were to do this project again, it would also make sense to use more machine-learning models just to make sure we find the best possible model. However, we could tell right from the EDA that our predictors were simply not explaining any of the variability in our RFI statistics.\
+\
+I thoroughly enjoyed working on this project and found it to be an exceptional first-time experience with machine learning. The journey from handling raw data to crafting a predictive model was both enjoyable and rewarding. As someone who is fascinated by the world of sports analytics, this project has made me excited for all the possibilities that lie ahead in this field.\
+\
+
+![](images/shohei-ohtani.gif){width="100%"}
+
